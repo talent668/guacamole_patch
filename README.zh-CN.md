@@ -97,11 +97,115 @@ recovery6 在刷新前会使用 `Cache-Control: no-cache` 重新验证当前文�
 
 recovery6 保留 recovery4 的画面热路径优化：不再从实时同步回调中每 5 秒展开完整画布并生成缩略图；逐帧显示统计默认关闭，仅在用户点击后临时启用 1 秒窗口。缩略图仍会在首次连接和断开时保存。
 
-- 颜色深度设为 `16`；
+- 保留 GFX 时，颜色深度先留空或使用 32 位；只有配合 `disable-gfx=true` 时才比较 16 位色，具体见下方部署优化说明；
 - 不启用“强制无损”；
 - 不启用壁纸、主题、字体平滑、拖动时显示窗口内容、桌面合成和菜单动画；
 - 保持位图、离屏和字形缓存启用，即不要勾选对应的“禁用缓存”；
 - 首次排查时把远程分辨率降到 `1280x720` 或 `1600x900`，DPI 设为 `96`。
+
+## FRP 与高延迟网络的部署优化
+
+以下是部署层的排查与优化经验，需要按实际拓扑手动应用；安装本补丁不会自动修改 Nginx、FRP、防火墙或 RDP 连接参数。
+
+### 缩短服务器内部的转发路径
+
+如果 HTTPS 入口、Guacamole Web 和 FRP 服务端位于同一台服务器，避免让它们通过服务器公网地址来回转发。一次实际部署将：
+
+```text
+浏览器 → 公网 HTTPS 入口 → 服务器公网地址 → 第二层 Nginx → Guacamole
+```
+
+调整为：
+
+```text
+浏览器 → 公网 HTTPS 入口 → 本机 Guacamole
+guacd → 同机 frps 的内网地址:13389 → frpc → Windows:3389
+```
+
+下面是放入**现有 HTTPS server 块**的示例 location。它假设入口代理运行在宿主机或使用 host 网络，Guacamole 已通过宿主机端口 `32768` 提供 `/guacamole/`：
+
+```nginx
+location / {
+    proxy_pass http://127.0.0.1:32768/guacamole/;
+    proxy_http_version 1.1;
+
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-Port $server_port;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection $http_connection;
+
+    proxy_buffering off;
+    proxy_request_buffering off;
+    proxy_cookie_path /guacamole/ /;
+}
+```
+
+- 替换原有 location，不要重复添加。保留现有公网 TLS、认证、访问控制和有效上传限制；只有确认内层代理没有额外安全功能后，才移除该中转环节。
+- 若入口代理在独立容器网络中，`127.0.0.1` 指向代理自身，应使用可达的 Docker 服务地址，例如 `http://guacamole:8080/guacamole/`。示例端口不是固定要求。
+- 上游明文 HTTP 仅适用于本机或受信任的容器内网；跨主机转发应保留适当的传输保护。
+- 示例把公网根路径映射到上游 `/guacamole/`，因此保留相应 Cookie 路径改写。公网路径不同的部署需要同步调整。
+- 关闭响应缓冲对 HTTP 隧道尤其重要；它不会直接降低已建立 WebSocket 的网络 RTT。请求缓冲关闭后，请求体可流式传递。
+
+修改前备份文件；先运行 `nginx -t`，通过后平滑重载。检查首页、静态资源、登录和 WebSocket 升级，再重新连接远程桌面。仅看到 HTTP `101` 不能证明 RDP 登录或操作体验正常。回滚时恢复原文件，重新检查并平滑重载。
+
+### RDP 画面配置：可比较的方案，不是通用最优值
+
+Guacamole 1.6.0 的 GFX 路径要求 32 位色。保留 GFX 时，颜色深度可先留空或设为 32 位；手动填写 16 位不会覆盖 GFX 的要求。
+
+若需要比较传统画面路径，可以在具体 RDP 连接中尝试以下参数。它们是 **Guacamole 连接参数**，不是 `frpc.toml` 或 `guacamole.properties` 配置：
+
+```properties
+disable-gfx=true
+color-depth=16
+width=1280
+height=720
+resize-method=display-update
+force-lossless=false
+dpi=96
+enable-wallpaper=false
+enable-theming=false
+enable-font-smoothing=false
+enable-desktop-composition=false
+enable-full-window-drag=false
+enable-menu-animations=false
+```
+
+这个组合降低色彩精度，并不保证比 GFX 更快；应在相同内容、分辨率和网络条件下对比。继续保留位图、离屏和字形缓存。更改连接参数后重新连接生效；`display-update` 允许分辨率随浏览器窗口变化，所以 `1280×720` 是初始请求尺寸，不是固定上限。
+
+`force-lossless=false` 不等于禁用所有无损压缩，而是允许 Guacamole 按画面选择压缩方式。优先排查延迟时，不建议同时强制无损。
+
+### FRP 路由与入口限制
+
+- guacd 与 frps 同机时，可以将 RDP 目标改为 **frps 可达的内网地址与映射端口**。不要把 Windows 的本机 `127.0.0.1:3389` 填到另一台服务器上的 guacd 中。
+- 只通过 Guacamole 使用 RDP 时，将映射端口（如 `13389`）限制为受信任的 guacd/服务器来源。先核对 NAT 后实际来源，并把专用规则放在已有整段端口放行规则之前，同时覆盖 IPv4 和 IPv6。
+- Docker 地址、网络模式或公网 NAT 地址改变后，应复核允许规则；不要用一条广泛拒绝规则破坏同一 frpc 的其他业务。
+- 如果**运行 frpc 的 Windows**被自己的 Mihomo TUN 接管，可以在现有 `tun.route-exclude-address` 列表中追加 FRP 服务器 IP 的 `/32` 地址。例如 `198.51.100.10/32` 只是文档示例，必须替换为实际服务器地址，并保留已有排除项。
+- Mihomo 的 `DIRECT` 规则仍可能经过 TUN。保存后核对持久配置、运行配置和实际路由，例如 Windows 的 `Find-NetRoute -RemoteIPAddress <FRPS_IP>`。
+- 被控 Windows 的 TUN 排除不会改变另一台客户端电脑的公司出口、代理或 VPN；该案例保持公司网络现状。
+- 不要为消除 `work connection pool is full` 日志而盲目增大连接池。代理注册成功也不代表本机后端已启动；公网 RDP 端口按策略被拦截时，外部探测失败可能正是预期结果。
+
+### 验证结果与边界
+
+2026-10-27 的一次实际部署中，取消服务器公网回环和额外代理、关闭请求与响应缓冲后：
+
+| 检查 | 结果 |
+| --- | --- |
+| Nginx 配置校验与平滑重载 | 通过 |
+| HTTPS 首页与修改前内容比较 | HTTP 200，内容一致 |
+| WebSocket 升级测试 | HTTP 101；这只是传输握手检查 |
+| 同机 HTTPS 首页请求，前后各 5 次 | 总耗时中位数约 41.6 ms → 30.2 ms |
+| 后续使用反馈 | 用户报告操作比之前顺畅很多 |
+
+这些是特定部署中的观测，不是通用性能承诺。首页请求耗时不是“按键到画面显示”延迟，也不能据此量化每一项配置的贡献；红色提示残留是否彻底解决仍需独立验证。
+
+此前采样的网页侧 TCP RTT 约 179–180 ms，FRP 侧约 46–51 ms，服务器内部约 0.1–0.2 ms。若中间代理终止 TCP，服务器看到的 RTT 还不等于完整的客户端路径；两段 RTT 相加也只是粗略估算。Windows 的一次 12 秒采样未见资源不足丢帧、编码耗时最高约 1 ms，这只代表当时的负载。
+
+排查时区分“整台远程桌面都慢”和“只有远端浏览器慢”，并在实际操作期间同步观察客户端、代理、guacd、FRP 和 Windows。先保留有效配置，一次只比较一个变量，不要仅凭红条、单次 ping 或低 CPU 占用认定根因。
+
+参考：[Guacamole 反向代理](https://guacamole.apache.org/doc/1.6.0/gug/reverse-proxy.html)、[RDP 连接参数](https://guacamole.apache.org/doc/1.6.0/gug/configuring-guacamole.html)、[FRP 网络与连接池](https://gofrp.org/en/docs/features/common/network/network/)、[Mihomo TUN 排除路由](https://wiki.metacubex.one/config/inbound/tun/#route-exclude-address)。
 
 ## GitHub Actions 构建
 

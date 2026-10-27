@@ -97,11 +97,115 @@ Chrome, Edge, video, animation, and complex page scrolling inside remote Windows
 
 Recovery6 retains recovery4's display hot-path optimization: the live sync callback no longer flattens the full display every five seconds for thumbnails, and per-frame statistics are disabled by default and enabled with a one-second window only after intentional clicks. Thumbnails are still saved after the first connected frame and on disconnect.
 
-- `16`-bit color depth;
+- with GFX enabled, leave color depth unset or use 32-bit color; compare 16-bit color only together with `disable-gfx=true`, as described below;
 - force-lossless disabled;
 - wallpaper, theming, font smoothing, full-window drag, desktop composition, and menu animations disabled;
 - bitmap, offscreen, and glyph caching enabled by leaving their "disable" options unchecked;
 - `1280x720` or `1600x900` with `96` DPI during initial troubleshooting.
+
+## Deployment tuning for FRP and high-latency networks
+
+These are deployment-level troubleshooting and tuning notes that must be applied to the actual topology. Installing this web patch does not automatically change Nginx, FRP, firewall rules, or RDP connection parameters.
+
+### Shorten forwarding paths inside the server
+
+When the HTTPS ingress, Guacamole web application, and FRP server share a host, avoid forwarding through that host's public address. One deployment changed:
+
+```text
+Browser -> public HTTPS ingress -> server public address -> second Nginx -> Guacamole
+```
+
+to:
+
+```text
+Browser -> public HTTPS ingress -> local Guacamole
+guacd -> same-host frps private address:13389 -> frpc -> Windows:3389
+```
+
+The following location belongs inside an **existing HTTPS server block**. It assumes the ingress runs on the host or uses host networking, and Guacamole exposes `/guacamole/` through host port `32768`:
+
+```nginx
+location / {
+    proxy_pass http://127.0.0.1:32768/guacamole/;
+    proxy_http_version 1.1;
+
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-Port $server_port;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection $http_connection;
+
+    proxy_buffering off;
+    proxy_request_buffering off;
+    proxy_cookie_path /guacamole/ /;
+}
+```
+
+- Replace the existing location rather than adding a duplicate. Preserve public TLS, authentication, access controls, and effective upload limits. Remove an inner proxy only after checking that it provides no additional security controls.
+- In a separate container network, `127.0.0.1` refers to the proxy itself. Use a reachable Docker service address such as `http://guacamole:8080/guacamole/` instead. The example port is not a requirement.
+- Plain HTTP upstreams are appropriate only for the local host or a trusted container network; retain suitable transport protection across hosts.
+- This example maps the public root to upstream `/guacamole/`, including its cookie path. Adapt both mappings if the public path differs.
+- Disabling response buffering matters especially for HTTP tunnels; it does not directly reduce the network RTT of an established WebSocket. Disabling request buffering permits streaming request bodies.
+
+Back up the configuration, run `nginx -t`, and gracefully reload only after validation succeeds. Check the homepage, assets, login, and WebSocket upgrade, then reconnect the desktop. HTTP `101` alone does not validate RDP login or responsiveness. To roll back, restore the original file, validate it, and gracefully reload.
+
+### RDP display settings: a comparison profile, not a universal optimum
+
+Guacamole 1.6.0's GFX path requires 32-bit color. With GFX enabled, initially leave color depth unset or use 32 bits; requesting 16 bits does not override the GFX requirement.
+
+To compare the legacy display path, try the following on the specific RDP connection. These are **Guacamole connection parameters**, not settings for `frpc.toml` or `guacamole.properties`:
+
+```properties
+disable-gfx=true
+color-depth=16
+width=1280
+height=720
+resize-method=display-update
+force-lossless=false
+dpi=96
+enable-wallpaper=false
+enable-theming=false
+enable-font-smoothing=false
+enable-desktop-composition=false
+enable-full-window-drag=false
+enable-menu-animations=false
+```
+
+This profile reduces color fidelity and is not guaranteed to outperform GFX. Compare identical content, resolution, and network conditions. Keep bitmap, offscreen, and glyph caches enabled. Reconnect after changing connection parameters. With `display-update`, the resolution can follow the browser window, so `1280x720` is the initial requested size, not a fixed maximum.
+
+`force-lossless=false` does not disable all lossless compression: it lets Guacamole choose an encoding for the content. Avoid simultaneously forcing lossless compression while investigating latency.
+
+### FRP routing and access restrictions
+
+- When guacd and frps share a host, the RDP target can use **a reachable private frps address and mapped port**. Do not point a remote guacd at the Windows machine's local `127.0.0.1:3389`.
+- If RDP is used only through Guacamole, restrict the mapped port, such as `13389`, to trusted guacd/server sources. Verify the actual post-NAT source first, place specific rules before existing broad port-range allowances, and cover IPv4 and IPv6.
+- Recheck the allow rules when Docker addresses, networking modes, or public NAT addresses change. Do not disrupt other services sharing the frpc instance with a broad deny rule.
+- If the **Windows host running frpc** is intercepted by its own Mihomo TUN, append the FRP server's `/32` address to the existing `tun.route-exclude-address` list. `198.51.100.10/32` is a documentation example only: replace it with the actual server address and retain existing exclusions.
+- A Mihomo `DIRECT` rule can still traverse TUN. Verify the persistent configuration, running configuration, and effective route after applying the change, for example with Windows `Find-NetRoute -RemoteIPAddress <FRPS_IP>`.
+- A TUN exclusion on the controlled Windows host does not change a different client computer's corporate egress, proxy, or VPN. The corporate network was left as-is in this case.
+- Do not blindly increase connection pools to silence `work connection pool is full`. Successful proxy registration does not prove that the local backend is running. A failed external RDP-port probe can be the intended result of the access policy.
+
+### Observed results and limits
+
+In one deployment on 2026-10-27, removing the server's public-address round trip and extra proxy, and disabling request/response buffering produced these checks:
+
+| Check | Result |
+| --- | --- |
+| Nginx configuration validation and graceful reload | Passed |
+| HTTPS homepage and before/after content comparison | HTTP 200; identical content |
+| WebSocket upgrade test | HTTP 101; transport handshake only |
+| Five same-host HTTPS homepage requests before and after | Median total time approximately 41.6 ms -> 30.2 ms |
+| Subsequent user feedback | Remote interaction felt substantially smoother |
+
+These are observations from a particular deployment, not general performance guarantees. Homepage response time is not keypress-to-display latency and does not isolate the contribution of each change. Complete resolution of persistent red warnings still requires separate verification.
+
+Earlier samples showed browser-facing TCP RTT around 179-180 ms, FRP-side RTT around 46-51 ms, and internal-server RTT around 0.1-0.2 ms. If a proxy terminates TCP, the server's RTT does not describe the entire client path; summing segment RTTs is only a rough estimate. A 12-second Windows sample showed no resource-related skipped frames and at most about 1 ms encoding time, which describes only that workload.
+
+Distinguish whole-desktop lag from a slow browser application inside Windows. Observe the client, proxy, guacd, FRP, and Windows during actual interaction. Keep improvements that work and compare one variable at a time; a red warning, one ping, or low CPU alone does not establish the cause.
+
+References: [Guacamole reverse proxy](https://guacamole.apache.org/doc/1.6.0/gug/reverse-proxy.html), [RDP connection parameters](https://guacamole.apache.org/doc/1.6.0/gug/configuring-guacamole.html), [FRP networking and connection pools](https://gofrp.org/en/docs/features/common/network/network/), and [Mihomo TUN route exclusions](https://wiki.metacubex.one/config/inbound/tun/#route-exclude-address).
 
 ## GitHub Actions build
 
